@@ -183,21 +183,21 @@ class Pipeline(object):
         f0_coarse = np.rint(f0_mel).astype(np.int32)
         return f0_coarse, f0bak  # 1-0
 
-    def vc(
-        self,
-        model,
-        net_g,
-        sid,
-        audio0,
-        pitch,
-        pitchf,
-        times,
-        index,
-        big_npy,
-        index_rate,
-        version,
-        protect,
-    ):  # ,file_index,file_big_npy
+    # def vc(
+    #     self,
+    #     model,
+    #     net_g,
+    #     sid,
+    #     audio0,
+    #     pitch,
+    #     pitchf,
+    #     times,
+    #     index,
+    #     big_npy,
+    #     index_rate,
+    #     version,
+    #     protect,
+    # ):  # ,file_index,file_big_npy
         feats = torch.from_numpy(audio0)
         if self.is_half:
             feats = feats.half()
@@ -277,6 +277,115 @@ class Pipeline(object):
         times[0] += t1 - t0
         times[2] += t2 - t1
         return audio1
+    def vc(
+        self,
+        model,
+        net_g,
+        sid,
+        audio0,
+        pitch,
+        pitchf,
+        times,
+        index,
+        big_npy,
+        index_rate,
+        version,
+        protect,
+    ):  # ,file_index,file_big_npy
+        # 在函数开始处添加protect值处理
+        protect_value = 0
+        if isinstance(protect, (int, float)):
+            protect_value = protect
+        elif isinstance(protect, dict) and 'value' in protect and isinstance(protect['value'], (int, float)):
+            protect_value = protect['value']
+        elif isinstance(protect, dict):
+            protect_value = 0  # 默认值
+        
+        feats = torch.from_numpy(audio0)
+        if self.is_half:
+            feats = feats.half()
+        else:
+            feats = feats.float()
+        if feats.dim() == 2:  # double channels
+            feats = feats.mean(-1)
+        assert feats.dim() == 1, feats.dim()
+        feats = feats.view(1, -1)
+        padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
+
+        inputs = {
+            "source": feats.to(self.device),
+            "padding_mask": padding_mask,
+            "output_layer": 9 if version == "v1" else 12,
+        }
+        t0 = ttime()
+        with torch.no_grad():
+            logits = model.extract_features(**inputs)
+            feats = model.final_proj(logits[0]) if version == "v1" else logits[0]
+        
+        # 第一处修改
+        if protect_value < 0.5 and pitch is not None and pitchf is not None:
+            feats0 = feats.clone()
+            
+        if (
+            not isinstance(index, type(None))
+            and not isinstance(big_npy, type(None))
+            and index_rate != 0
+        ):
+            npy = feats[0].cpu().numpy()
+            if self.is_half:
+                npy = npy.astype("float32")
+
+            # _, I = index.search(npy, 1)
+            # npy = big_npy[I.squeeze()]
+
+            score, ix = index.search(npy, k=8)
+            weight = np.square(1 / score)
+            weight /= weight.sum(axis=1, keepdims=True)
+            npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
+
+            if self.is_half:
+                npy = npy.astype("float16")
+            feats = (
+                torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate
+                + (1 - index_rate) * feats
+            )
+
+        feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
+        
+        # 第二处修改
+        if protect_value < 0.5 and pitch is not None and pitchf is not None:
+            feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(
+                0, 2, 1
+            )
+        t1 = ttime()
+        p_len = audio0.shape[0] // self.window
+        if feats.shape[1] < p_len:
+            p_len = feats.shape[1]
+            if pitch is not None and pitchf is not None:
+                pitch = pitch[:, :p_len]
+                pitchf = pitchf[:, :p_len]
+
+        # 第三处修改
+        if protect_value < 0.5 and pitch is not None and pitchf is not None:
+            pitchff = pitchf.clone()
+            pitchff[pitchf > 0] = 1
+            pitchff[pitchf < 1] = protect_value  # 这里也使用protect_value
+            pitchff = pitchff.unsqueeze(-1)
+            feats = feats * pitchff + feats0 * (1 - pitchff)
+            feats = feats.to(feats0.dtype)
+        p_len = torch.tensor([p_len], device=self.device).long()
+        with torch.no_grad():
+            hasp = pitch is not None and pitchf is not None
+            arg = (feats, p_len, pitch, pitchf, sid) if hasp else (feats, p_len, sid)
+            audio1 = (net_g.infer(*arg)[0][0, 0]).data.cpu().float().numpy()
+            del hasp, arg
+        del feats, p_len, padding_mask
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        t2 = ttime()
+        times[0] += t1 - t0
+        times[2] += t2 - t1
+        return audio1
 
     def pipeline(
         self,
@@ -322,6 +431,9 @@ class Pipeline(object):
             audio_sum = np.zeros_like(audio)
             for i in range(self.window):
                 audio_sum += np.abs(audio_pad[i : i - self.window])
+            # for t in range(self.t_center, audio.shape[0], self.t_center):
+            # 确保 t_center 是整数类型
+            # self.t_center = int(self.t_center) if isinstance(self.t_center, str) else self.t_center
             for t in range(self.t_center, audio.shape[0], self.t_center):
                 opt_ts.append(
                     t

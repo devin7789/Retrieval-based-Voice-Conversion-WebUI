@@ -642,7 +642,8 @@ def train_index(exp_dir1, version19):
         try:
             big_npy = (
                 MiniBatchKMeans(
-                    n_clusters=10000,
+                    # n_clusters=10000,
+                    n_clusters=256,
                     verbose=True,
                     batch_size=256 * config.n_cpu,
                     compute_labels=False,

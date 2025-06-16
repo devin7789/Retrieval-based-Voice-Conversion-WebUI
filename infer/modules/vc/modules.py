@@ -184,6 +184,20 @@ class VC:
                 file_index = file_index2
             else:
                 file_index = ""  # 防止小白写错，自动帮他替换掉
+            # 在第188行之前添加
+            print(f"Debug: self.pipeline is {self.pipeline}")
+            print(f"Debug: type(self.pipeline) is {type(self.pipeline)}")
+
+            if self.pipeline is None:
+                print("Error: Pipeline is None! Model may not be loaded properly.")
+                # return None
+                return "Error: Model not loaded properly", (16000, np.zeros(1024, dtype=np.float32))
+            # 确保protect参数是正确的类型
+            if isinstance(protect, dict) and 'value' in protect:
+                protect_value = protect['value']
+            else:
+                protect_value = protect
+
 
             audio_opt = self.pipeline.pipeline(
                 self.hubert_model,
@@ -202,9 +216,14 @@ class VC:
                 resample_sr,
                 rms_mix_rate,
                 self.version,
-                protect,
+                # protect,
+                protect_value,  # 传递处理后的值
                 f0_file,
             )
+            # 检查audio_opt是否为None
+            if audio_opt is None:
+                return "Processing failed, no audio generated", (16000, np.zeros(1024, dtype=np.float32))
+
             if self.tgt_sr != resample_sr >= 16000:
                 tgt_sr = resample_sr
             else:
@@ -222,7 +241,9 @@ class VC:
         except:
             info = traceback.format_exc()
             logger.warning(info)
-            return info, (None, None)
+            # return info, (None, None)
+            # 返回错误信息和空音频数据，而不是None
+            return info, (16000, np.zeros(1024, dtype=np.float32))
 
     def vc_multi(
         self,
